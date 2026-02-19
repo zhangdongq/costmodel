@@ -84,6 +84,7 @@ from .memory_model import (
     CheckpointGranularity,
     OffloadTarget,
     AutoMemoryOptimizer,
+    RecomputeMethod,
 )
 
 from .integrated_costmodel import (
@@ -91,6 +92,14 @@ from .integrated_costmodel import (
     CostModelConfig,
     PredictionResult,
     create_qwen3_30b_costmodel,
+)
+
+from .compute_profiler import (
+    ComputeProfiler,
+    ComputeProfile,
+    GEMMTestPoint,
+    profile_and_save,
+    load_latest_profile,
 )
 
 # 兼容旧 API
@@ -145,12 +154,20 @@ __all__ = [
     "CheckpointGranularity",
     "OffloadTarget",
     "AutoMemoryOptimizer",
+    "RecomputeMethod",
     
     # Integrated
     "GalvatronCostModel",
     "CostModelConfig",
     "PredictionResult",
     "create_qwen3_30b_costmodel",
+    
+    # Compute Profiler
+    "ComputeProfiler",
+    "ComputeProfile",
+    "GEMMTestPoint",
+    "profile_and_save",
+    "load_latest_profile",
     
     # Legacy Compatibility
     "IntegratedCostModel",

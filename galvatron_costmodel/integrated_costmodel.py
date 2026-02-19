@@ -23,6 +23,7 @@ from .memory_model import (
     ZeROConfig, ActivationCheckpointConfig, OffloadConfig,
     ZeROStage, CheckpointGranularity, AutoMemoryOptimizer
 )
+from .compute_profiler import ComputeProfile, ComputeProfiler, load_latest_profile
 
 
 @dataclass
@@ -147,6 +148,11 @@ class PredictionResult:
     compute_efficiency: float = 0.0
     mfu: float = 0.0  # Model FLOPs Utilization
     
+    # 吞吐量指标
+    tokens_per_step: int = 0            # 每 step 处理的 tokens 数
+    tokens_per_second: float = 0.0      # 总吞吐量 (tokens/s)
+    tokens_per_second_per_gpu: float = 0.0  # 每卡吞吐量 (tokens/s/GPU)
+    
     def to_dict(self) -> Dict:
         """转换为字典"""
         return {
@@ -173,6 +179,11 @@ class PredictionResult:
                 "compute_efficiency": self.compute_efficiency,
                 "mfu": self.mfu,
             },
+            "throughput": {
+                "tokens_per_step": self.tokens_per_step,
+                "tokens_per_second": self.tokens_per_second,
+                "tokens_per_second_per_gpu": self.tokens_per_second_per_gpu,
+            },
         }
 
 
@@ -193,13 +204,15 @@ class GalvatronCostModel:
     - 配置排序和验证
     """
     
-    def __init__(self, config: CostModelConfig):
+    def __init__(self, config: CostModelConfig, compute_profile: ComputeProfile = None):
         self.config = config
+        self.compute_profile = compute_profile
         
         # 初始化子模型
         self.comm_model = CommunicationModel(config.hardware)
         self.compute_model = ComputationModel(
-            config.hardware, config.model, ComputeMode.LINEAR
+            config.hardware, config.model, ComputeMode.LINEAR,
+            compute_profile=compute_profile
         )
         self.memory_model = MemoryModel(config.model, config.training)
         
@@ -210,6 +223,31 @@ class GalvatronCostModel:
         
         # 校准数据
         self.calibration_data: Dict = {}
+    
+    def load_compute_profile(self, profile_path: str = None, profile_dir: str = "./profiles"):
+        """
+        加载算力 Profile
+        
+        Args:
+            profile_path: Profile 文件路径（如果指定，直接加载该文件）
+            profile_dir: Profile 目录（如果未指定 profile_path，从该目录加载最新的）
+        
+        Returns:
+            加载的 ComputeProfile
+        """
+        if profile_path:
+            profiler = ComputeProfiler()
+            self.compute_profile = profiler.load_profile(profile_path)
+        else:
+            self.compute_profile = load_latest_profile(profile_dir)
+        
+        if self.compute_profile:
+            # 更新计算模型的 profile
+            self.compute_model.compute_profile = self.compute_profile
+            print(f"✅ 已加载算力 Profile: {self.compute_profile.gpu_name} "
+                  f"({self.compute_profile.test_date})")
+        
+        return self.compute_profile
     
     def predict_step_time(self, parallel: ParallelConfig,
                           micro_batch_size: int = None,
@@ -386,6 +424,10 @@ class GalvatronCostModel:
         result.compute_efficiency = self._calculate_compute_efficiency(result, parallel)
         result.mfu = self._calculate_mfu(result, parallel, micro_batch_size, sequence_length)
         
+        # 计算吞吐量
+        result.tokens_per_step, result.tokens_per_second, result.tokens_per_second_per_gpu = \
+            self._calculate_throughput(result, parallel, micro_batch_size, sequence_length)
+        
         return result
     
     def _calculate_compute_efficiency(self, result: PredictionResult,
@@ -458,6 +500,40 @@ class GalvatronCostModel:
         # 限制在合理范围内
         return min(mfu, 1.0)
     
+    def _calculate_throughput(self, result: PredictionResult,
+                              parallel: ParallelConfig,
+                              micro_batch_size: int,
+                              sequence_length: int) -> Tuple[int, float, float]:
+        """
+        计算吞吐量指标
+        
+        Args:
+            result: 预测结果（包含 total_step_time_ms）
+            parallel: 并行配置
+            micro_batch_size: micro batch size
+            sequence_length: 序列长度
+        
+        Returns:
+            (tokens_per_step, tokens_per_second, tokens_per_second_per_gpu)
+        """
+        if result.total_step_time_ms <= 0:
+            return 0, 0.0, 0.0
+        
+        # 每 step 处理的 tokens 数
+        # = micro_batch_size × seq_len × gradient_accumulation_steps × dp_degree
+        num_micro_batches = self.config.training.gradient_accumulation_steps
+        tokens_per_step = micro_batch_size * sequence_length * num_micro_batches * parallel.dp_degree
+        
+        # 总吞吐量 (tokens/s)
+        step_time_seconds = result.total_step_time_ms / 1000.0
+        tokens_per_second = tokens_per_step / step_time_seconds
+        
+        # 每卡吞吐量 (tokens/s/GPU)
+        world_size = parallel.dp_degree * parallel.tp_degree * parallel.pp_degree
+        tokens_per_second_per_gpu = tokens_per_second / world_size
+        
+        return tokens_per_step, tokens_per_second, tokens_per_second_per_gpu
+    
     def rank_configurations(self, configs: List[Dict], top_k: int = 10) -> List[Dict]:
         """
         对并行配置列表进行排序
@@ -492,6 +568,8 @@ class GalvatronCostModel:
                     "fits_memory": prediction.fits_memory,
                     "compute_efficiency": prediction.compute_efficiency,
                     "mfu": prediction.mfu,
+                    "tokens_per_second": prediction.tokens_per_second,
+                    "tokens_per_second_per_gpu": prediction.tokens_per_second_per_gpu,
                 })
             except Exception as e:
                 print(f"Warning: Failed to predict config {cfg}: {e}")
@@ -514,23 +592,24 @@ class GalvatronCostModel:
         if not results:
             return
         
-        print("\n" + "=" * 130)
+        print("\n" + "=" * 150)
         print("🚀 Galvatron CostModel - 并行配置排序报告")
-        print("=" * 130)
-        print(f"{'排名':<4} {'并行配置':<25} {'时延(ms)':<12} {'显存(GB)':<12} "
-              f"{'满足约束':<10} {'效率':<8} {'MFU':<8}")
-        print("-" * 130)
+        print("=" * 150)
+        print(f"{'排名':<4} {'并行配置':<20} {'时延(ms)':<12} {'显存(GB)':<10} "
+              f"{'约束':<6} {'效率':<8} {'MFU':<8} {'tok/s':<12} {'tok/s/GPU':<12}")
+        print("-" * 150)
         
         for r in results:
             cfg = r["config"]
             config_str = f"DP{cfg.get('dp_degree',1)}-TP{cfg.get('tp_degree',1)}-PP{cfg.get('pp_degree',1)}-EP{cfg.get('ep_degree',1)}"
             fits = "✅" if r["fits_memory"] else "❌"
             
-            print(f"{r['rank']:<4} {config_str:<25} {r['total_step_time_ms']:<12.2f} "
-                  f"{r['total_memory_gb']:<12.2f} {fits:<10} "
-                  f"{r['compute_efficiency']:<8.1%} {r['mfu']:<8.1%}")
+            print(f"{r['rank']:<4} {config_str:<20} {r['total_step_time_ms']:<12.2f} "
+                  f"{r['total_memory_gb']:<10.2f} {fits:<6} "
+                  f"{r['compute_efficiency']:<8.1%} {r['mfu']:<8.1%} "
+                  f"{r['tokens_per_second']:<12,.0f} {r['tokens_per_second_per_gpu']:<12,.0f}")
         
-        print("-" * 130)
+        print("-" * 150)
         
         if results:
             best = results[0]
@@ -538,6 +617,7 @@ class GalvatronCostModel:
             print(f"   • 预计时延: {best['total_step_time_ms']:.2f} ms")
             print(f"   • 显存占用: {best['total_memory_gb']:.2f} GB")
             print(f"   • MFU: {best['mfu']:.1%}")
+            print(f"   • 吞吐量: {best['tokens_per_second']:,.0f} tok/s ({best['tokens_per_second_per_gpu']:,.0f} tok/s/GPU)")
     
     def calibrate_with_data(self, calibration_data: List[Dict]):
         """

@@ -69,35 +69,87 @@ class ZeROConfig:
         return 1
 
 
+class RecomputeMethod(Enum):
+    """Recompute 方法"""
+    UNIFORM = "uniform"     # 均匀重计算（每 N 层重计算）
+    BLOCK = "block"         # 块状重计算
+
+
 @dataclass
 class ActivationCheckpointConfig:
     """Activation Checkpointing 配置"""
     granularity: CheckpointGranularity = CheckpointGranularity.NONE
-    checkpoint_num_layers: int = 1  # 块状 checkpoint 的层数间隔
+    checkpoint_num_layers: int = 1  # 块状 checkpoint 的层数间隔 / uniform 的重计算间隔
+    recompute_method: RecomputeMethod = RecomputeMethod.UNIFORM  # 重计算方法
     
-    def get_memory_reduction_factor(self) -> float:
-        """获取显存降低因子"""
+    def get_memory_reduction_factor(self, num_layers: int = 48) -> float:
+        """
+        获取显存降低因子
+        
+        Args:
+            num_layers: 模型总层数，用于更精确计算
+        
+        PaddleFormers recompute 策略说明：
+        - recompute_granularity: full + recompute_method: uniform + recompute_num_layers: N
+        - 表示每 N 层保存一次 checkpoint（边界激活）
+        - 中间 N-1 层的激活在反向时重新计算
+        - recompute_num_layers=1 表示每层都保存边界，但层内中间激活不保存
+        """
         if self.granularity == CheckpointGranularity.NONE:
             return 1.0
         elif self.granularity == CheckpointGranularity.SELECTIVE:
-            return 0.7  # 大约降低 30%
+            # 选择性 checkpoint：只保存 attention 输出，MLP 中间激活不保存
+            return 0.6  # 大约降低 40%
         elif self.granularity == CheckpointGranularity.FULL:
-            return 0.35  # 大约降低 65%
+            # Full recompute: 只保存层边界激活，层内中间激活全部重算
+            # 每层的中间激活（Q,K,V,attention scores,MLP中间值等）约占该层激活的 85-90%
+            # 只保存输入输出约为 10-15%
+            if self.recompute_method == RecomputeMethod.UNIFORM:
+                n = max(1, self.checkpoint_num_layers)
+                if n == 1:
+                    # 每层保存边界，层内中间激活重算
+                    # 只保留约 15% 的激活（层输入/输出）
+                    return 0.15
+                else:
+                    # 每 N 层保存一次边界，中间 N-1 层完全重算
+                    # 平均只保留 1/N 的边界激活 + 10% 开销
+                    return min(1.0, (1.0 / n) * 0.15 + 0.05)
+            else:
+                # block 方法
+                return 0.15 / max(1, self.checkpoint_num_layers)
         elif self.granularity == CheckpointGranularity.BLOCK:
             # 根据 checkpoint_num_layers 计算
-            return 1.0 / self.checkpoint_num_layers
+            return 0.15 / max(1, self.checkpoint_num_layers)
         return 1.0
     
     def get_recompute_overhead(self) -> float:
-        """获取重计算开销（时间倍数）"""
+        """
+        获取重计算开销（时间倍数）
+        
+        Full recompute 下，反向传播时需要重新计算前向激活
+        - 每层都需要重算前向，约增加 33% 的计算量（前向约占 1/3）
+        """
         if self.granularity == CheckpointGranularity.NONE:
             return 1.0
         elif self.granularity == CheckpointGranularity.SELECTIVE:
-            return 1.15  # 约 15% 额外计算
+            return 1.15  # 约 15% 额外计算（只重算 attention）
         elif self.granularity == CheckpointGranularity.FULL:
-            return 1.33  # 约 33% 额外计算（前向重算一次）
+            # Full recompute: 反向时需要重算前向
+            if self.recompute_method == RecomputeMethod.UNIFORM:
+                n = max(1, self.checkpoint_num_layers)
+                if n == 1:
+                    # 每层都保存边界，但层内激活重算
+                    # 需要重算整个前向，约增加 33%
+                    return 1.33
+                else:
+                    # 每 N 层保存一次边界，中间 N-1 层需要完全重算前向
+                    # 重算比例: (N-1)/N
+                    recompute_ratio = (n - 1) / n
+                    return 1.0 + recompute_ratio * 0.33
+            else:
+                return 1.33
         elif self.granularity == CheckpointGranularity.BLOCK:
-            return 1.0 + 0.33 / self.checkpoint_num_layers
+            return 1.33
         return 1.0
 
 
@@ -108,10 +160,27 @@ class OffloadConfig:
     activation_offload: OffloadTarget = OffloadTarget.NONE
     activation_offload_ratio: float = 0.0  # 0-1，offload 的激活比例
     
+    # Tensorwise Offload 配置（PaddleFormers 特性）
+    tensorwise_offload: bool = False  # 是否启用 tensorwise optimizer offload
+    tensorwise_offload_ratio: float = 0.95  # tensorwise offload 比例（默认 95% offload 到 CPU）
+    
     def get_optimizer_memory_factor(self) -> float:
-        """获取优化器显存因子"""
-        if self.optimizer_offload != OffloadTarget.NONE:
-            return 0.0  # 完全 offload 到 CPU/NVMe
+        """
+        获取优化器显存因子
+        
+        tensorwise_offload 特性说明：
+        - 优化器状态按 tensor 粒度动态 offload 到 CPU
+        - 计算时按需加载到 GPU，计算完成后 offload 回 CPU
+        - GPU 上只保留当前正在更新的 tensor 的优化器状态
+        - 实际 GPU 显存占用约为总优化器状态的 5-10%
+        """
+        if self.tensorwise_offload:
+            # tensorwise offload: 只保留少量状态在 GPU 用于流水线计算
+            # 保留比例 = 1 - offload 比例
+            return 1.0 - self.tensorwise_offload_ratio
+        elif self.optimizer_offload != OffloadTarget.NONE:
+            # 传统 offload: 完全 offload 到 CPU/NVMe
+            return 0.0
         return 1.0
     
     def get_activation_memory_factor(self) -> float:

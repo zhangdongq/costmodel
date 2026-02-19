@@ -180,10 +180,12 @@ class ComputationModel:
     1. static: 使用固定效率估算
     2. linear: 时间与 batch_size 成正比
     3. curve: 使用 α-β 模型拟合
+    4. profiled: 使用实测算力 Profile（推荐）
     """
     
     def __init__(self, hardware: HardwareConfig, model_config: ModelConfig,
-                 mode: ComputeMode = ComputeMode.LINEAR):
+                 mode: ComputeMode = ComputeMode.LINEAR,
+                 compute_profile = None):
         self.hardware = hardware
         self.model_config = model_config
         self.mode = mode
@@ -197,6 +199,9 @@ class ComputationModel:
         
         # Profiling 数据
         self.profiled_data: Dict = {}
+        
+        # 算力 Profile（实测数据）
+        self.compute_profile = compute_profile
     
     def _init_layer_profiles(self):
         """初始化层 Profile"""
@@ -254,8 +259,22 @@ class ComputationModel:
         # TP 并行切分
         parallel_flops = total_flops / tp_degree
         
-        # 效率
-        efficiency = profile.static_efficiency
+        # 效率 - 优先使用实测 Profile
+        if self.compute_profile is not None:
+            # 根据 GEMM 规模估算效率
+            h = self.model_config.hidden_size
+            ffn = self.model_config.intermediate_size
+            
+            if layer_type in [LayerType.ATTENTION]:
+                m, n, k = tokens, h, h
+            elif layer_type in [LayerType.MLP, LayerType.MOE_EXPERT]:
+                m, n, k = tokens, ffn, h
+            else:
+                m, n, k = tokens, h, h
+            
+            efficiency = self.compute_profile.get_efficiency(m, n, k)
+        else:
+            efficiency = profile.static_efficiency
         
         # 峰值算力 (TFLOPS)
         peak_tflops = self.hardware.gpu.get_effective_tflops("bf16")
